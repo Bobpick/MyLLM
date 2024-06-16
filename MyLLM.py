@@ -8,24 +8,35 @@ import re
 import argparse
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, processors
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import pandas as pd  # Added for Parquet support
-import torch.multiprocessing as mp
+import pandas as pd
+import threading
 
-# 1. Hyperparameters & Configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Device selection
-batch_size = 32  # Batch size for training
-block_size = 128  # Maximum sequence length for the transformer
-max_iters = 3000  # Total training iterations
-learning_rate = 3e-4  # Initial learning rate
-eval_iters = 50  # Evaluate every 'eval_iters' steps
-n_embd = 384  # Embedding dimension
-n_head = 4  # Number of attention heads
-n_layer = 4  # Number of transformer blocks
-dropout = 0.2  # Dropout probability
-num_workers = 4  # Number of worker processes for DataLoader
-accumulation_steps = 4  # Gradient accumulation steps
+# Hyperparameters & Configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+batch_size = 128  #512 for GPU
+block_size = 128
+max_iters = 3000
+learning_rate = 3e-4
+eval_iters = 50
+n_embd = 384
+n_head = 4
+n_layer = 4
+dropout = 0.2
+num_workers = 4 #10 for Ryzen 9
+accumulation_steps = 4
+model_dir = "saved_models"
+model_filename = "gpt_language_model.pt"
+os.makedirs(model_dir, exist_ok=True)
+model_path = os.path.join(model_dir, model_filename)
 
-# 2. Data Loading & Preprocessing
+# Global variables for threading
+train_loader = None
+val_loader = None
+vocab_size = None
+encode = None
+decode = None
+data_loading_event = threading.Event()
+
 def extract_text(filepath):
     if filepath.endswith(".txt"):
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -36,8 +47,11 @@ def extract_text(filepath):
             pdf = PdfReader(f)
             for page in pdf.pages:
                 text += page.extract_text()
+    elif filepath.endswith(".parquet"):
+        df = pd.read_parquet(filepath)
+        text = " ".join(df[df.columns[0]].astype(str).tolist())
     else:
-        raise ValueError("Unsupported file type. Please provide a .txt or .pdf file.")
+        raise ValueError("Unsupported file type. Please provide a .txt, .pdf, or .parquet file.")
     return text
 
 def clean_text(text, normalize=True):
@@ -57,7 +71,7 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         chunk = self.data[idx:idx + self.block_size + 1]
         x = chunk[:-1]
-        y = chunk[1:]
+        y = chunk[1:]  # Fix for invalid shape error
         return x, y
 
 def load_and_preprocess_data(filepath, normalize=True, use_subword=True, num_workers=4):
@@ -96,9 +110,7 @@ def load_and_preprocess_data(filepath, normalize=True, use_subword=True, num_wor
 
     return train_loader, val_loader, vocab_size, encode, decode
 
-# 3. Model Definition
 class Head(nn.Module):
-    """ one head of self-attention """
     def __init__(self, head_size):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
@@ -120,7 +132,6 @@ class Head(nn.Module):
         return out
 
 class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
@@ -133,7 +144,6 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class FeedForward(nn.Module):
-    """ a simple linear layer followed by a non-linearity """
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
@@ -147,7 +157,6 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    """ Transformer block: communication followed by computation """
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
@@ -222,38 +231,67 @@ def estimate_loss(model, val_loader, eval_iters):
     model.train()
     return {'val': sum(losses) / len(losses)}
 
-# 4. Training and Evaluation
 def train_model_in_process(rank, train_loader, val_loader, model, optimizer, scheduler, max_iters, eval_iters):
     model.train()
+    total_tokens_processed = 0
+    initial_tokens = 0  # Track initial tokens before training
+    max_lr_reductions = 5
+    lr_reductions = 0
+
     for iter in range(max_iters):
         print(f"Iteration {iter + 1}/{max_iters}")
+
+        # Validation and Learning Rate Scheduling
         if iter % eval_iters == 0:
             losses = estimate_loss(model, val_loader, eval_iters)
             scheduler.step(losses['val'])
             print(f"Step: {iter}, Val loss: {losses['val']:.3f}")
 
+            # Early Stopping Check
+            if optimizer.param_groups[0]['lr'] < learning_rate / 10:
+                lr_reductions += 1
+                if lr_reductions >= max_lr_reductions:
+                    print("Early stopping due to learning rate reduction.")
+                    break
+
+        # Training Loop (Batch Processing)
         total_loss = 0.0
         num_batches = len(train_loader)
 
         for batch_idx, (xb, yb) in enumerate(train_loader):
+            # Track initial tokens for the first iteration
+            if iter == 0 and batch_idx == 0:
+                initial_tokens = xb.numel()
+
             logits, loss = model.forward(xb.to(device), yb.to(device))
-            loss = loss / accumulation_steps  # Scale loss for gradient accumulation
+            loss = loss / accumulation_steps
             loss.backward()
 
             if (batch_idx + 1) % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item() * accumulation_steps  # Un-scale loss
+            total_loss += loss.item() * accumulation_steps
+            total_tokens_processed += xb.numel()
 
-            if (batch_idx + 1) % 50 == 0:  # Log every 50 batches
+            if (batch_idx + 1) % 50 == 0:
                 avg_loss = total_loss / (batch_idx + 1)
-                print(f"Iteration {iter + 1}/{max_iters}, Batch {batch_idx + 1}/{num_batches}, Avg Loss: {avg_loss:.3f}")
+                print(f"Iteration {iter + 1}/{max_iters}, Batch {batch_idx + 1}/{num_batches}, Avg Loss: {avg_loss:.3f}, Tokens processed: {total_tokens_processed}")
 
         print(f"Iteration {iter + 1}/{max_iters} completed.")
         print(f"Total loss for iteration {iter + 1}: {total_loss:.3f}")
 
-    print(f"Final loss: {total_loss:.3f}")
+    # Save Model (Only on Rank 0)
+    if rank == 0:
+        torch.save(model.state_dict(), model_path)
+        print(f"Model saved to {model_path}")
+
+    print(f"Initial tokens: {initial_tokens}")
+    print(f"Total tokens processed during training: {total_tokens_processed}")
+    # Calculate and display total tokens here (initial + added)
+    total_tokens = initial_tokens + total_tokens_processed
+    print(f"Total tokens: {total_tokens}") 
+
 
 def prompt_model(model, encode, decode):
     model.eval()
@@ -264,21 +302,40 @@ def prompt_model(model, encode, decode):
     print(generated_text)
 
 def main(data_file):
+    print("Greetings from MyLLM - Your Ultimate LLM Companion!")
+    global train_loader, val_loader, vocab_size, encode, decode
+
     if not os.path.exists(data_file):
         raise FileNotFoundError(f"File '{data_file}' not found.")
 
-    train_loader, val_loader, vocab_size, encode, decode = load_and_preprocess_data(data_file, num_workers=num_workers)
+    def data_loading_thread():
+        try:
+            global train_loader, val_loader, vocab_size, encode, decode
+            train_loader, val_loader, vocab_size, encode, decode = load_and_preprocess_data(data_file, num_workers=num_workers)
+        except Exception as e:
+            print(f"Data loading thread error: {e}")
 
-    model = GPTLanguageModel(vocab_size).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
+    def model_training_thread():
+        try:
+            model = GPTLanguageModel(vocab_size).to(device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
 
-    mp.spawn(train_model_in_process,
-             args=(train_loader, val_loader, model, optimizer, scheduler, max_iters, eval_iters),
-             nprocs=1,
-             join=True)
+            data_loading_event.wait()
 
-    prompt_model(model, encode, decode)
+            train_model_in_process(0, train_loader, val_loader, model, optimizer, scheduler, max_iters, eval_iters)
+            prompt_model(model, encode, decode)
+        except Exception as e:
+            print(f"Model training thread error: {e}")
+
+    data_thread = threading.Thread(target=data_loading_thread)
+    model_thread = threading.Thread(target=model_training_thread)
+
+    data_thread.start()
+    data_thread.join()
+    data_loading_event.set()
+    model_thread.start()
+    model_thread.join()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a GPT Language Model on text or PDF data.")
