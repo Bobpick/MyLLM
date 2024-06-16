@@ -1,3 +1,4 @@
+![MyLLM](_fd23d3d2-3422-46a1-b15d-f6ecd4a65d4c.jpg)
 ## MyLLM: A Customizable Language Model Trainer
 
 ### Overview
@@ -7,6 +8,7 @@ MyLLM is a Python-based tool for training transformer-based language models on c
 ### Features
 
 * **Data Extraction:** Supports .txt, .pdf, and .parquet files.
+* **Parquet Storage:** for smaller and faster accessibility to trained data.
 * **Data Cleaning:** Normalizes text, removes extraneous characters, and filters out overly short or long sentences.
 * **Tokenization:** Utilizes the Hugging Face `AutoTokenizer` for subword tokenization (BPE).
 * **Transformer Models:** Choose from GPT-2, GPT-Neo, or T5 architectures.
