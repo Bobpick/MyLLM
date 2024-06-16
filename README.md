@@ -1,75 +1,54 @@
-# GPT Language Model for Text & PDF Data
+## MyLLM: A Customizable Language Model Trainer
 
-This project provides a PyTorch implementation of a GPT (Generative Pre-trained Transformer) language model, designed to be trained on text and PDF documents. It incorporates modern best practices for natural language processing (NLP) and deep learning.
+### Overview
 
-## Key Features & Benefits
+MyLLM is a Python-based tool for training transformer-based language models on custom text data. It supports various transformer architectures (GPT-2, GPT-Neo, T5) and allows for experimentation with different hyperparameters. The model is trained using a multi-threaded approach for efficient data loading and preprocessing.
 
-* **Versatile Data Processing:** Handles both text (.txt) and PDF (.pdf) files, as well as Parquet (.parquet) files, allowing you to train on a variety of sources.
-* **Customizable Tokenization:** Supports both character-level and subword (BPE) tokenization for optimal model performance depending on your specific data.
-* **Optimized Training:** Utilizes multithreading for efficient data loading and leverages the `ReduceLROnPlateau` scheduler for adaptive learning rate adjustments.
-* **State-of-the-Art Architecture:** Implements the GPT architecture with multi-head attention, layer normalization, and feed-forward layers for powerful text generation capabilities.
-* **Text Generation:** The trained model can be used to generate new text given a starting prompt.
-* **Easy to Extend:** The modular structure of the code makes it straightforward to add new features or modify existing components.
+### Features
 
-## How to Use
+* **Data Extraction:** Supports .txt, .pdf, and .parquet files.
+* **Data Cleaning:** Normalizes text, removes extraneous characters, and filters out overly short or long sentences.
+* **Tokenization:** Utilizes the Hugging Face `AutoTokenizer` for subword tokenization (BPE).
+* **Transformer Models:** Choose from GPT-2, GPT-Neo, or T5 architectures.
+* **Hyperparameter Tuning:** Easily adjust embedding size, attention heads, layers, etc.
+* **Mixed Precision:**  Leverages `torch.bfloat16` on supported GPUs for faster training.
+* **Performance Evaluation:**  Tracks validation loss and perplexity.
+* **Text Generation:** Generates sample text periodically during training to assess progress.
+* **PyTorch Profiler:** Integrated for performance optimization.
 
-### 1. Installation
+### Installation
 
-Ensure you have the following prerequisites installed:
+1. **Clone the Repository:**
+   ```bash
+   git clone <repository_url>
+   cd MyLLM
+   ```
 
-* Python (3.6+)
-* PyTorch (1.4+)
-* PyPDF2
-* tokenizers
-* pandas
+2. **Install Dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-You can install the required packages using pip:
+### Usage
 
-```bash
-pip install torch PyPDF2 tokenizers pandas
-```
-### 2. Preparing Your Data
+1. **Prepare Your Data:**
+   - Place your `.txt`, `.pdf`, or `.parquet` data files in the same directory as the script or provide the full file path.
 
-Create a `.txt`, `.pdf` (or `.parquet`) file containing the text you want your model to learn from. 
+2. **Train the Model:**
+   ```bash
+   python train_language_model.py <data_file> --model_type <gpt2|gpt_neo|t5>
+   ```
+   * Replace `<data_file>` with the path to your training data.
+   * Optionally specify `--model_type` to choose the desired transformer architecture (default is GPT-2).
 
-### 3. Training the Model
+3. **Output:**
+   - The model will be trained for the specified number of iterations.
+   - Validation loss and perplexity will be printed periodically.
+   - Sample generated text will be shown every 100 iterations.
+   - The trained model will be saved in the "saved_models" directory.
+   - TensorBoard logs will be written to the "./logdir" directory, use `tensorboard --logdir=./logdir` to visualize the results in a web browser.
 
-Run the script from your terminal, providing the path to your data file:
+### Customization
 
-```bash
-python your_script_name.py your_data_file.txt
-```
-(Replace `your_script_name.py` and `your_data_file.txt` with the actual names.)
-
-The model will be trained for the specified number of iterations, saving checkpoints at regular intervals.
-
-### 4. Generating Text
-
-Once trained, you can use the `prompt_model` function to generate text given a context:
-
-```python
-prompt_model(model, encode, decode)
-```
-(This will generate text based on the prompt "The quick brown fox".)
-
-
-## Customization
-
-You can adjust various hyperparameters in the code to fine-tune the model's behavior:
-
-* `batch_size`
-* `block_size`
-* `max_iters`
-* `learning_rate`
-* `eval_iters`
-* ...and more
-
-Feel free to experiment to find the optimal settings for your dataset and use case.
-
-## Contributing
-
-Contributions are welcome! If you have any ideas, bug fixes, or improvements, please open an issue or submit a pull request.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+* Modify the hyperparameters at the beginning of the `train_language_model.py` file to experiment with different model configurations.
+* Adjust data cleaning and preprocessing steps in the `extract_text` and `clean_text` functions to suit your specific data format.
