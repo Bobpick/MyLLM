@@ -10,19 +10,22 @@ from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, pr
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import pandas as pd
 import threading
+import pyarrow.parquet as pq
+import pyarrow as pa
+import datetime
 
 # Hyperparameters & Configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-batch_size = 128  #512 for GPU
+batch_size = 128  # 512 for GPU
 block_size = 128
-max_iters = 3000
+max_iters = 200
 learning_rate = 3e-4
 eval_iters = 50
 n_embd = 384
 n_head = 4
 n_layer = 4
 dropout = 0.2
-num_workers = 4 #10 for Ryzen 9
+num_workers = 4  # 10 for Ryzen 9
 accumulation_steps = 4
 model_dir = "saved_models"
 model_filename = "gpt_language_model.pt"
@@ -37,10 +40,15 @@ encode = None
 decode = None
 data_loading_event = threading.Event()
 
+
 def extract_text(filepath):
     if filepath.endswith(".txt"):
-        with open(filepath, 'r', encoding='utf-8') as f:
-            text = f.read()
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            with open(filepath, 'r', encoding='latin1') as f:
+                text = f.read()
     elif filepath.endswith(".pdf"):
         text = ""
         with open(filepath, 'rb') as f:
@@ -71,7 +79,7 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         chunk = self.data[idx:idx + self.block_size + 1]
         x = chunk[:-1]
-        y = chunk[1:]  # Fix for invalid shape error
+        y = chunk[1:]
         return x, y
 
 def load_and_preprocess_data(filepath, normalize=True, use_subword=True, num_workers=4):
@@ -231,12 +239,28 @@ def estimate_loss(model, val_loader, eval_iters):
     model.train()
     return {'val': sum(losses) / len(losses)}
 
+
+import torch
+import os
+import datetime
+
+# Remove these imports if they're not used elsewhere
+# import pyarrow.parquet as pq
+# import pyarrow as pa
+
 def train_model_in_process(rank, train_loader, val_loader, model, optimizer, scheduler, max_iters, eval_iters):
     model.train()
     total_tokens_processed = 0
-    initial_tokens = 0  # Track initial tokens before training
+    initial_tokens = 0
     max_lr_reductions = 5
     lr_reductions = 0
+    start_time = datetime.datetime.now()
+    
+    # Load the latest interim model if it exists
+    latest_model = max([f for f in os.listdir(model_dir) if f.startswith("interim_model_") and f.endswith(".pt")], default=None)
+    if latest_model:
+        model.load_state_dict(torch.load(os.path.join(model_dir, latest_model)))
+        print(f"Loaded interim model: {latest_model}")
 
     for iter in range(max_iters):
         print(f"Iteration {iter + 1}/{max_iters}")
@@ -246,6 +270,11 @@ def train_model_in_process(rank, train_loader, val_loader, model, optimizer, sch
             losses = estimate_loss(model, val_loader, eval_iters)
             scheduler.step(losses['val'])
             print(f"Step: {iter}, Val loss: {losses['val']:.3f}")
+
+            # Check if loss threshold is reached
+            if losses['val'] <= 0.050:
+                print("Loss threshold reached. Stopping training.")
+                break
 
             # Early Stopping Check
             if optimizer.param_groups[0]['lr'] < learning_rate / 10:
@@ -263,7 +292,8 @@ def train_model_in_process(rank, train_loader, val_loader, model, optimizer, sch
             if iter == 0 and batch_idx == 0:
                 initial_tokens = xb.numel()
 
-            logits, loss = model.forward(xb.to(device), yb.to(device))
+            xb, yb = xb.to(device), yb.to(device)
+            logits, loss = model(xb, yb)
             loss = loss / accumulation_steps
             loss.backward()
 
@@ -281,18 +311,30 @@ def train_model_in_process(rank, train_loader, val_loader, model, optimizer, sch
         print(f"Iteration {iter + 1}/{max_iters} completed.")
         print(f"Total loss for iteration {iter + 1}: {total_loss:.3f}")
 
-    # Save Model (Only on Rank 0)
+        # Save interim model
+        interim_model_path = os.path.join(model_dir, f"interim_model_{iter+1}.pt")
+        torch.save(model.state_dict(), interim_model_path)
+        print(f"Saved interim model: {interim_model_path}")
+
+        # Estimate completion time
+        elapsed_time = datetime.datetime.now() - start_time
+        avg_time_per_iter = elapsed_time / (iter + 1)
+        remaining_iters = max_iters - (iter + 1)
+        estimated_completion_time = datetime.datetime.now() + (avg_time_per_iter * remaining_iters)
+        print(f"Estimated completion time: {estimated_completion_time}")
+
+    # Save final model
     if rank == 0:
-        torch.save(model.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
+        final_model_path = os.path.join(model_dir, "final_model.pt")
+        torch.save(model.state_dict(), final_model_path)
+        print(f"Final model saved to {final_model_path}")
 
     print(f"Initial tokens: {initial_tokens}")
     print(f"Total tokens processed during training: {total_tokens_processed}")
-    # Calculate and display total tokens here (initial + added)
     total_tokens = initial_tokens + total_tokens_processed
-    print(f"Total tokens: {total_tokens}") 
-
-
+    print(f"Total tokens: {total_tokens}")
+    
+    
 def prompt_model(model, encode, decode):
     model.eval()
     context = "The quick brown fox"
@@ -318,6 +360,13 @@ def main(data_file):
     def model_training_thread():
         try:
             model = GPTLanguageModel(vocab_size).to(device)
+            
+            # Load the latest interim model if it exists
+            latest_model = max([f for f in os.listdir(model_dir) if f.startswith("interim_model_")], default=None)
+            if latest_model:
+                load_model_from_parquet(model, os.path.join(model_dir, latest_model))
+                print(f"Loaded interim model: {latest_model}")
+            
             optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
             scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
 
@@ -327,7 +376,7 @@ def main(data_file):
             prompt_model(model, encode, decode)
         except Exception as e:
             print(f"Model training thread error: {e}")
-
+            
     data_thread = threading.Thread(target=data_loading_thread)
     model_thread = threading.Thread(target=model_training_thread)
 
