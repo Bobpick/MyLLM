@@ -1,55 +1,114 @@
-## MyLLM: Your Personal AI Language Model Generator
+# MyLLM
 
-**MyLLM** empowers you to create your own customized language model trained on your specific data. Whether you have a text file, a PDF document, or even a Parquet dataset, MyLLM makes it easy to harness the power of AI for text generation and understanding.
+This repository contains a project that trains and generates text using a GPT-based language model enhanced with Retrieval-Augmented Generation (RAG). The model utilizes PyTorch for deep learning, Sentence-Transformers for encoding documents, and FAISS for efficient similarity search. There is the capability to pause training and resume at a later time, as well as early termination to avoid overfitting.
 
-### Key Features
+## Table of Contents
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Training](#training)
+  - [Text Generation](#text-generation)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [License](#license)
 
-* **Versatility:** Works with .txt, .pdf, and .parquet file formats.
-* **Customization:** Train the model on your own unique dataset for highly personalized results.
-* **State-of-the-Art:** Uses the GPT (Generative Pre-trained Transformer) architecture, known for its exceptional text generation capabilities.
-* **Efficiency:** Leverages PyTorch for fast training and inference on both CPU and GPU.
-* **Ease of Use:** Simple command-line interface for training and generating text.
+## Installation
 
-### Installation & Setup
+To set up the project, follow these steps:
 
-1. **Prerequisites:** 
-   * Python 3.x
-   * PyTorch
-   * PyPDF2
-   * Tokenizers
-   * Pandas (for .parquet files)
-   * Install these packages using pip: `pip install torch PyPDF2 tokenizers pandas`
-
-2. **Clone the Repository:**
+1. **Clone the repository**:
    ```bash
-   git clone https://your_repository_url/MyLLM.git
-   cd MyLLM
+   git clone https://github.com/yourusername/gpt-language-model-rag.git
+   cd gpt-language-model-rag
    ```
 
-### Usage
-
-1. **Train the Model:**
+2. **Create and activate a virtual environment** (optional but recommended):
    ```bash
-   python MyLLM.py your_data_file.txt 
+   python -m venv venv
+   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
    ```
-   Replace `your_data_file.txt` with the path to your text, PDF, or Parquet file. The training process will start, and a saved model will be created in the `saved_models` directory.
 
-2. **Generate Text (After Training):** 
-   * The script automatically generates a sample text after training, using the prompt "The quick brown fox". You can easily modify this in the `prompt_model` function.
-   * For more interactive text generation, integrate the trained model into a separate script or application.
+3. **Install the required dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-### Configuration
+## Usage
 
-* **Hyperparameters:**  Adjust settings like `batch_size`, `block_size`, `learning_rate`, etc., in the script to fine-tune the training process.
-* **Subword Tokenization:** By default, the model uses subword tokenization (BPE) for a better vocabulary. You can disable this by setting `use_subword` to `False` in the `load_and_preprocess_data` function.
+### Training
 
-### Notes
+To train the model, use the following command:
 
-* **Data Cleaning:** The script includes basic text cleaning (lowercase, removing punctuation). Consider more advanced cleaning based on your dataset.
-* **Advanced Users:** Explore the code to customize the model architecture, training loop, or integrate it into your existing projects.
+```bash
+python MyLLM.py <path_to_text_file> [options]
+```
 
-### Contributing
+**Arguments**:
+- `filepath`: Path to the input text, PDF, or Parquet file.
 
-Contributions are welcome! Please feel free to open issues or pull requests to improve the code or add new features. 
+**Options**:
+- `--normalize`: Normalize text during preprocessing.
+- `--use_subword`: Use subword tokenization.
+- `--handle_unicode`: Handle Unicode characters during preprocessing.
+- `--resume`: Resume training from the interim checkpoint.
 
-**Disclaimer:** This project is intended for educational and personal use. For commercial applications, please consult the relevant licenses of the libraries and tools used in this project. 
+**Example**:
+```bash
+python MyLLM.py data/sample.txt --normalize --use_subword --handle_unicode
+```
+
+### Text Generation
+
+To generate text using the trained model, use the following command:
+
+```bash
+python MyLLM.py <path_to_text_file> --generate --start_text "<starting text>" [options]
+```
+
+**Options**:
+- `--start_text`: Starting text for text generation.
+- `--max_new_tokens`: Maximum number of new tokens to generate (default: 100).
+- `--temperature`: Sampling temperature for text generation (default: 1.0).
+
+**Example**:
+```bash
+python MyLLM.py data/sample.txt --generate --start_text "Once upon a time" --max_new_tokens 50 --temperature 0.7
+```
+
+### Stopping and Restarting
+
+The training process can be stopped and resumed using checkpoints. If the training is interrupted or the `--resume` flag is used, the model will continue training from the last saved checkpoint. Additionally, if the model reaches a specified target loss, it will stop training early, even if it hasn't completed the full number of epochs.
+
+## Configuration
+
+The configuration for the model is handled via the `ModelConfig` class within `MyLLM.py`. Key parameters include:
+
+- `device`: Device to run the model on (`cuda` if available, else `cpu`).
+- `batch_size`: Batch size for training.
+- `block_size`: Size of input blocks.
+- `max_iters`: Maximum number of training iterations.
+- `learning_rate`: Learning rate for the optimizer.
+- `eval_interval`: Interval for evaluation.
+- `n_embd`: Dimension of the embeddings.
+- `n_head`: Number of attention heads.
+- `n_layer`: Number of transformer layers.
+- `dropout`: Dropout rate.
+- `num_workers`: Number of worker threads for data loading.
+- `model_dir`, `log_dir`, `checkpoint_dir`: Directories for saving models, logs, and checkpoints.
+
+## Project Structure
+
+- `MyLLM.py`: Main script for training and text generation, contains the `ModelConfig` class.
+- `data/`: Directory for storing input data.
+- `logs/`: Directory for storing logs.
+- `saved_models/`: Directory for storing saved models.
+- `checkpoints/`: Directory for storing interim checkpoints.
+- `requirements.txt`: List of required dependencies.
+
+## Contributing
+
+Contributions are welcome! Please fork the repository and submit a pull request with your changes.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
