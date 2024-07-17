@@ -1,105 +1,116 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, processors
 from PyPDF2 import PdfReader
+import pandas as pd
 import os
 import re
 import argparse
-from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, processors
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import pandas as pd
-import threading
-import pyarrow.parquet as pq
-import pyarrow as pa
-import datetime
+from typing import Tuple, Callable
+import logging
+from tqdm import tqdm
+import unicodedata
+import faiss
+from sentence_transformers import SentenceTransformer
 
-# Hyperparameters & Configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-batch_size = 128  # 512 for GPU
-block_size = 128
-max_iters = 200
-learning_rate = 3e-4
-eval_iters = 50
-n_embd = 384
-n_head = 4
-n_layer = 4
-dropout = 0.2
-num_workers = 4  # 10 for Ryzen 9
-accumulation_steps = 4
-model_dir = "saved_models"
-model_filename = "gpt_language_model.pt"
-os.makedirs(model_dir, exist_ok=True)
-model_path = os.path.join(model_dir, model_filename)
+class RAG:
+    def __init__(self, documents, model_name='all-MiniLM-L6-v2'):
+        self.documents = documents
+        self.encoder = SentenceTransformer(model_name)
+        self.index = self.create_index()
 
-# Global variables for threading
-train_loader = None
-val_loader = None
-vocab_size = None
-encode = None
-decode = None
-data_loading_event = threading.Event()
+    def create_index(self):
+        embeddings = self.encoder.encode(self.documents)
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(embeddings.astype('float32'))
+        return index
 
+    def retrieve(self, query, k=5):
+        query_vector = self.encoder.encode([query])
+        _, I = self.index.search(query_vector.astype('float32'), k)
+        return [self.documents[i] for i in I[0]]
+class ModelConfig:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.batch_size = 32
+        self.block_size = 128
+        self.max_iters = 1000  # increased number of epochs
+        self.learning_rate = 1e-3  # increased learning rate
+        self.eval_interval = 50
+        self.n_embd = 384
+        self.n_head = 6
+        self.n_layer = 6
+        self.dropout = 0.2
+        self.num_workers = 0  # set to 0 to avoid multiprocessing issues
+        self.model_dir = "saved_models"
+        self.model_filename = "gpt_language_model.pt"
+        self.log_dir = "logs"
+        self.checkpoint_dir = "checkpoints"
+        self.early_stopping_patience = 20
+        self.target_loss = 0.05
+        self.save_interval = 10  # Save interim model every 10 epochs
+        self.interim_filename = "interim_model.pt"  # New parameter for interim model filename
 
-def extract_text(filepath):
+# Create an instance of ModelConfig
+config = ModelConfig()
+
+# Set up logging
+os.makedirs(config.log_dir, exist_ok=True)
+logging.basicConfig(filename=os.path.join(config.log_dir, 'training.log'), level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+def extract_text(filepath: str) -> str:
     if filepath.endswith(".txt"):
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            with open(filepath, 'r', encoding='latin1') as f:
-                text = f.read()
+        encodings = ['utf-8', 'iso-8859-1', 'windows-1252']
+        for encoding in encodings:
+            try:
+                with open(filepath, 'r', encoding=encoding) as f:
+                    text = f.read()
+                    return clean_text(text)  # Apply cleaning function
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"Unable to decode the file with any of the following encodings: {encodings}")
     elif filepath.endswith(".pdf"):
-        text = ""
         with open(filepath, 'rb') as f:
             pdf = PdfReader(f)
-            for page in pdf.pages:
-                text += page.extract_text()
+            return " ".join(page.extract_text() for page in pdf.pages)
     elif filepath.endswith(".parquet"):
         df = pd.read_parquet(filepath)
-        text = " ".join(df[df.columns[0]].astype(str).tolist())
+        return " ".join(df[df.columns[0]].astype(str).tolist())
     else:
         raise ValueError("Unsupported file type. Please provide a .txt, .pdf, or .parquet file.")
+
+def clean_text(text: str) -> str:
+    # Normalize unicode characters
+    text = unicodedata.normalize('NFKD', text)
+    # Remove non-ASCII characters
+    text = re.sub(r'[^\x00-\x7F]+', '', text)
+    # Replace smart quotes and dashes
+    text = text.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'").replace('–', '-').replace('—', '-')
     return text
 
-def clean_text(text, normalize=True):
-    if normalize:
-        text = text.lower()
-        text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
-    return text
+def create_tokenizer(text: str) -> Tokenizer:
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    trainer = trainers.BpeTrainer(vocab_size=10000, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
+    tokenizer.train_from_iterator([text], trainer)
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="<s> $A </s>",
+        pair="<s> $A </s> <s> $B </s>",
+        special_tokens=[("<s>", 0), ("</s>", 2)],
+    )
+    tokenizer.decoder = decoders.BPEDecoder()
+    return tokenizer
 
-class TextDataset(Dataset):
-    def __init__(self, data, block_size):
-        self.data = data
-        self.block_size = block_size
-
-    def __len__(self):
-        return len(self.data) - self.block_size
-
-    def __getitem__(self, idx):
-        chunk = self.data[idx:idx + self.block_size + 1]
-        x = chunk[:-1]
-        y = chunk[1:]
-        return x, y
-
-def load_and_preprocess_data(filepath, normalize=True, use_subword=True, num_workers=4):
-    text = extract_text(filepath)
-    text = clean_text(text, normalize)
+def create_encoding_functions(use_subword: bool, text: str):
     if use_subword:
-        tokenizer = Tokenizer(models.BPE())
-        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-        trainer = trainers.BpeTrainer(vocab_size=10000, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
-        tokenizer.train_from_iterator([text], trainer)
-        tokenizer.post_processor = processors.TemplateProcessing(
-            single="<s> $A </s>",
-            pair="<s> $A </s> <s> $B </s>",
-            special_tokens=[("<s>", 0), ("</s>", 2)],
-        )
-        tokenizer.decoder = decoders.BPEDecoder()
-        encoded_text = tokenizer.encode(text).ids
-        vocab_size = tokenizer.get_vocab_size()
+        tokenizer = create_tokenizer(text)
         encode = lambda s: tokenizer.encode(s).ids
         decode = lambda l: tokenizer.decode(l)
+        vocab_size = tokenizer.get_vocab_size()
     else:
         chars = sorted(set(text))
         vocab_size = len(chars)
@@ -107,19 +118,49 @@ def load_and_preprocess_data(filepath, normalize=True, use_subword=True, num_wor
         int_to_string = {i: ch for i, ch in enumerate(chars)}
         encode = lambda s: [string_to_int[c] for c in s]
         decode = lambda l: ''.join([int_to_string[i] for i in l])
-        encoded_text = encode(text)
+    
+    return encode, decode, vocab_size
 
-    data = torch.tensor(encoded_text, dtype=torch.long)
-    train_dataset = TextDataset(data[:int(0.8 * len(data))], block_size)
-    val_dataset = TextDataset(data[int(0.8 * len(data)):], block_size)
+class IterableTextDataset(IterableDataset):
+    def __init__(self, filepath: str, block_size: int, encode_fn: Callable):
+        self.filepath = filepath
+        self.block_size = block_size
+        self.encode_fn = encode_fn
+        self.length = None
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    def __iter__(self):
+        with open(self.filepath, 'r', encoding='utf-8') as f:
+            text = f.read()
+        encoded = self.encode_fn(text)
+        self.length = len(encoded) - self.block_size
+        for i in range(0, self.length):
+            chunk = encoded[i:i + self.block_size + 1]
+            x = chunk[:-1]
+            y = chunk[1:]
+            yield torch.tensor(x), torch.tensor(y)
+
+    def __len__(self):
+        if self.length is None:
+            for _ in self:
+                pass
+        return self.length
+
+def load_and_preprocess_data(filepath: str, config: ModelConfig, normalize: bool = True, use_subword: bool = True, handle_unicode: bool = True) -> Tuple[DataLoader, DataLoader, int, Callable, Callable]:
+    text = extract_text(filepath)
+    text = clean_text(text, normalize, handle_unicode)
+
+    encode, decode, vocab_size = create_encoding_functions(use_subword, text)
+
+    train_dataset = IterableTextDataset(filepath, config.block_size, encode)
+    val_dataset = IterableTextDataset(filepath, config.block_size, encode)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, num_workers=config.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, num_workers=config.num_workers)
 
     return train_loader, val_loader, vocab_size, encode, decode
 
 class Head(nn.Module):
-    def __init__(self, head_size):
+    def __init__(self, head_size: int, n_embd: int, block_size: int, dropout: float):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
@@ -140,9 +181,9 @@ class Head(nn.Module):
         return out
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
+    def __init__(self, num_heads: int, head_size: int, n_embd: int, dropout: float):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.heads = nn.ModuleList([Head(head_size, n_embd, config.block_size, dropout) for _ in range(num_heads)])
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
@@ -152,7 +193,7 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, n_embd: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
@@ -165,43 +206,36 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd: int, n_head: int):
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
+        self.sa = MultiHeadAttention(n_head, head_size, n_embd, config.dropout)
+        self.ffwd = FeedForward(n_embd, config.dropout)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        y = self.sa(x)
-        x = self.ln1(x + y)
-        y = self.ffwd(x)
-        x = self.ln2(x + y)
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 class GPTLanguageModel(nn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size: int, config: ModelConfig, rag: RAG, encode_fn: Callable, decode_fn: Callable):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-        self.apply(self._init_weights)
+        self.token_embedding_table = nn.Embedding(vocab_size, config.n_embd)
+        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        self.blocks = nn.Sequential(*[Block(config.n_embd, config.n_head) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, vocab_size)
+        self.block_size = config.block_size
+        self.rag = rag
+        self.encode = encode_fn
+        self.decode = decode_fn
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, index, targets=None):
-        B, T = index.shape
-        tok_emb = self.token_embedding_table(index)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
         x = tok_emb + pos_emb
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -211,184 +245,186 @@ class GPTLanguageModel(nn.Module):
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
 
-    def generate(self, index, max_new_tokens, temperature=1.0):
+    def generate(self, idx, max_new_tokens, temperature=1.0):
+        generated = []
         for _ in range(max_new_tokens):
-            index_cond = index[:, -block_size:]
-            logits, _ = self(index_cond)
+            idx_cond = idx[:, -self.block_size:]
+            # RAG retrieval
+            input_text = self.decode(idx_cond[0].tolist())
+            retrieved_docs = self.rag.retrieve(input_text)
+            context = " ".join(retrieved_docs) + " " + input_text
+
+            # Encode the context back to token indices
+            context_idx = torch.tensor(self.encode(context), dtype=torch.long).unsqueeze(0).to(idx.device)
+
+            # Use the last self.block_size tokens if context is too long
+            if context_idx.size(1) > self.block_size:
+                context_idx = context_idx[:, -self.block_size:]
+
+            logits, _ = self(context_idx)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
-            index_next = torch.multinomial(probs, num_samples=1)
-            index = torch.cat((index, index_next), dim=1)
-        return index
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+            generated.append(idx_next.item())
 
-def estimate_loss(model, val_loader, eval_iters):
-    model.eval()
-    losses = []
-    with torch.no_grad():
-        for iter, (xb, yb) in enumerate(val_loader):
-            logits, loss = model.forward(xb.to(device), yb.to(device))
-            losses.append(loss.item())
-            if iter >= eval_iters:
-                break
-    model.train()
-    return {'val': sum(losses) / len(losses)}
+        return idx, generated
 
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, config: ModelConfig):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
 
-import torch
-import os
-import datetime
+    best_val_loss = float('inf')
+    patience_counter = 0
 
-# Remove these imports if they're not used elsewhere
-# import pyarrow.parquet as pq
-# import pyarrow as pa
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    interim_path = os.path.join(config.checkpoint_dir, config.interim_filename)
 
-def train_model_in_process(rank, train_loader, val_loader, model, optimizer, scheduler, max_iters, eval_iters):
-    model.train()
-    total_tokens_processed = 0
-    initial_tokens = 0
-    max_lr_reductions = 5
-    lr_reductions = 0
-    start_time = datetime.datetime.now()
-    
-    # Load the latest interim model if it exists
-    latest_model = max([f for f in os.listdir(model_dir) if f.startswith("interim_model_") and f.endswith(".pt")], default=None)
-    if latest_model:
-        model.load_state_dict(torch.load(os.path.join(model_dir, latest_model)))
-        print(f"Loaded interim model: {latest_model}")
-
-    for iter in range(max_iters):
-        print(f"Iteration {iter + 1}/{max_iters}")
-
-        # Validation and Learning Rate Scheduling
-        if iter % eval_iters == 0:
-            losses = estimate_loss(model, val_loader, eval_iters)
-            scheduler.step(losses['val'])
-            print(f"Step: {iter}, Val loss: {losses['val']:.3f}")
-
-            # Check if loss threshold is reached
-            if losses['val'] <= 0.050:
-                print("Loss threshold reached. Stopping training.")
-                break
-
-            # Early Stopping Check
-            if optimizer.param_groups[0]['lr'] < learning_rate / 10:
-                lr_reductions += 1
-                if lr_reductions >= max_lr_reductions:
-                    print("Early stopping due to learning rate reduction.")
-                    break
-
-        # Training Loop (Batch Processing)
-        total_loss = 0.0
-        num_batches = len(train_loader)
-
-        for batch_idx, (xb, yb) in enumerate(train_loader):
-            # Track initial tokens for the first iteration
-            if iter == 0 and batch_idx == 0:
-                initial_tokens = xb.numel()
-
-            xb, yb = xb.to(device), yb.to(device)
-            logits, loss = model(xb, yb)
-            loss = loss / accumulation_steps
+    for epoch in range(config.max_iters):
+        model.train()
+        total_loss = 0
+        num_batches = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.max_iters}")
+        for batch_idx, (x, y) in enumerate(progress_bar):
+            x, y = x.to(config.device), y.to(config.device)
+            optimizer.zero_grad()
+            logits, loss = model(x, y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-            if (batch_idx + 1) % accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            total_loss += loss.item()
+            num_batches += 1
+            progress_bar.set_postfix({'loss': total_loss / num_batches, 'lr': optimizer.param_groups[0]['lr']})
 
-            total_loss += loss.item() * accumulation_steps
-            total_tokens_processed += xb.numel()
+        avg_train_loss = total_loss / num_batches
+        val_loss = evaluate_model(model, val_loader, config)
+        scheduler.step(val_loss)
 
-            if (batch_idx + 1) % 50 == 0:
-                avg_loss = total_loss / (batch_idx + 1)
-                print(f"Iteration {iter + 1}/{max_iters}, Batch {batch_idx + 1}/{num_batches}, Avg Loss: {avg_loss:.3f}, Tokens processed: {total_tokens_processed}")
+        logging.info(
+            f"Epoch {epoch + 1}: Train loss {avg_train_loss:.4f}, Val loss {val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
 
-        print(f"Iteration {iter + 1}/{max_iters} completed.")
-        print(f"Total loss for iteration {iter + 1}: {total_loss:.3f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), os.path.join(config.model_dir, "best_" + config.model_filename))
+        else:
+            patience_counter += 1
+            if patience_counter >= config.early_stopping_patience:
+                logging.info(f"Early stopping triggered after {epoch + 1} epochs")
+                break
 
         # Save interim model
-        interim_model_path = os.path.join(model_dir, f"interim_model_{iter+1}.pt")
-        torch.save(model.state_dict(), interim_model_path)
-        print(f"Saved interim model: {interim_model_path}")
+        if (epoch + 1) % config.save_interval == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_loss': val_loss,
+            }, interim_path)
+            logging.info(f"Interim model saved: {interim_path}")
 
-        # Estimate completion time
-        elapsed_time = datetime.datetime.now() - start_time
-        avg_time_per_iter = elapsed_time / (iter + 1)
-        remaining_iters = max_iters - (iter + 1)
-        estimated_completion_time = datetime.datetime.now() + (avg_time_per_iter * remaining_iters)
-        print(f"Estimated completion time: {estimated_completion_time}")
+        # Stop if target loss is reached
+        if val_loss <= config.target_loss:
+            logging.info(f"Target loss of {config.target_loss} reached after {epoch + 1} epochs. Stopping training.")
+            break
 
-    # Save final model
-    if rank == 0:
-        final_model_path = os.path.join(model_dir, "final_model.pt")
-        torch.save(model.state_dict(), final_model_path)
-        print(f"Final model saved to {final_model_path}")
+    return model
 
-    print(f"Initial tokens: {initial_tokens}")
-    print(f"Total tokens processed during training: {total_tokens_processed}")
-    total_tokens = initial_tokens + total_tokens_processed
-    print(f"Total tokens: {total_tokens}")
-    
-    
-def prompt_model(model, encode, decode):
+def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig):
     model.eval()
-    context = "The quick brown fox"
-    context_encoded = torch.tensor([encode(context)], dtype=torch.long).to(device)
-    output = model.generate(context_encoded, max_new_tokens=50)
-    generated_text = decode(output[0].cpu().numpy().tolist())
-    print(generated_text)
+    total_loss = 0
+    num_batches = 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(config.device), y.to(config.device)
+            logits, loss = model(x, y)
+            total_loss += loss.item()
+            num_batches += 1
+    return total_loss / num_batches
 
-def main(data_file):
-    print("Greetings from MyLLM - Your Ultimate LLM Companion!")
-    global train_loader, val_loader, vocab_size, encode, decode
+def save_model(model: nn.Module, filepath: str):
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'rag_documents': model.rag.documents,
+        'vocab_size': len(model.token_embedding_table.weight),
+    }, filepath)
 
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"File '{data_file}' not found.")
+def load_model(filepath: str, model_class, vocab_size: int, config: ModelConfig, rag: RAG, encode_fn: Callable, decode_fn: Callable):
+    checkpoint = torch.load(filepath)
+    model = model_class(vocab_size, config, rag, encode_fn, decode_fn)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.rag.documents = checkpoint['rag_documents']
+    model.rag.index = model.rag.create_index()  # Recreate the index
+    return model
 
-    def data_loading_thread():
-        try:
-            global train_loader, val_loader, vocab_size, encode, decode
-            train_loader, val_loader, vocab_size, encode, decode = load_and_preprocess_data(data_file, num_workers=num_workers)
-        except Exception as e:
-            print(f"Data loading thread error: {e}")
 
-    def model_training_thread():
-        try:
-            model = GPTLanguageModel(vocab_size).to(device)
-            
-            # Load the latest interim model if it exists
-            latest_model = max([f for f in os.listdir(model_dir) if f.startswith("interim_model_")], default=None)
-            if latest_model:
-                load_model_from_parquet(model, os.path.join(model_dir, latest_model))
-                print(f"Loaded interim model: {latest_model}")
-            
-            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
+def main(args):
+    os.makedirs(config.model_dir, exist_ok=True)
+    os.makedirs(config.log_dir, exist_ok=True)
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-            data_loading_event.wait()
+    # Load and preprocess data
+    train_loader, val_loader, vocab_size, encode, decode = load_and_preprocess_data(
+        args.filepath, config, args.normalize, args.use_subword, args.handle_unicode
+    )
 
-            train_model_in_process(0, train_loader, val_loader, model, optimizer, scheduler, max_iters, eval_iters)
-            prompt_model(model, encode, decode)
-        except Exception as e:
-            print(f"Model training thread error: {e}")
-            
-    data_thread = threading.Thread(target=data_loading_thread)
-    model_thread = threading.Thread(target=model_training_thread)
+    # Load documents for RAG (only once)
+    with open(args.filepath, 'r', encoding='utf-8') as f:
+        documents = f.read().split('\n')  # Split by paragraphs or sentences as needed
+    rag = RAG(documents)
 
-    data_thread.start()
-    data_thread.join()
-    data_loading_event.set()
-    model_thread.start()
-    model_thread.join()
+    if args.generate:
+        model = load_model(os.path.join(config.model_dir, config.model_filename), GPTLanguageModel, vocab_size, config, rag, encode, decode)
+        model = model.to(config.device)
+        model.eval()
+
+        context = torch.tensor(encode(args.start_text), dtype=torch.long).unsqueeze(0).to(config.device)
+        generated_indices, _ = model.generate(context, args.max_new_tokens, args.temperature)
+        generated_text = decode(generated_indices[0].tolist())
+        print("Generated text:")
+        print(generated_text)
+        logging.info(f"Generated text: {generated_text}")
+    else:
+        interim_path = os.path.join(config.checkpoint_dir, config.interim_filename)
+        if args.resume and os.path.exists(interim_path):
+            # Load the interim model
+            checkpoint = torch.load(interim_path)
+            model = GPTLanguageModel(vocab_size, config, rag, encode, decode).to(config.device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            logging.info(f"Resuming training from epoch {start_epoch}")
+        else:
+            model = GPTLanguageModel(vocab_size, config, rag, encode, decode).to(config.device)
+            start_epoch = 0
+
+        model = train_model(model, train_loader, val_loader, config)
+        save_model(model, os.path.join(config.model_dir, config.model_filename))
+        logging.info(f"Model saved to {os.path.join(config.model_dir, config.model_filename)}")
+        print(f"Model saved to {os.path.join(config.model_dir, config.model_filename)}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a GPT Language Model on text or PDF data.")
-    parser.add_argument("data_file", type=str, help="Path to the text or PDF file for training.")
+    parser = argparse.ArgumentParser(description="Train and Generate Text using a GPT model.")
+    parser.add_argument("filepath", type=str, help="Path to the input text, PDF, or Parquet file.")
+    parser.add_argument("--generate", action="store_true", help="Flag to indicate text generation instead of training.")
+    parser.add_argument("--start_text", type=str, default="", help="Starting text for text generation.")
+    parser.add_argument("--max_new_tokens", type=int, default=100, help="Maximum number of new tokens to generate.")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature for text generation.")
+    parser.add_argument("--normalize", action="store_true", help="Normalize text during preprocessing.")
+    parser.add_argument("--use_subword", action="store_true", help="Use subword tokenization.")
+    parser.add_argument("--handle_unicode", action="store_true", help="Handle Unicode characters during preprocessing.")
+    parser.add_argument("--resume", action="store_true", help="Resume training from the interim checkpoint.")
     args = parser.parse_args()
 
-    main(args.data_file)
+    main(args)
