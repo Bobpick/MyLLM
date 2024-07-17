@@ -15,7 +15,9 @@ from tqdm import tqdm
 import unicodedata
 import faiss
 from sentence_transformers import SentenceTransformer
+import warnings
 
+warnings.filterwarnings("ignore", category=FutureWarning)
 class RAG:
     def __init__(self, documents, model_name='all-MiniLM-L6-v2'):
         self.documents = documents
@@ -68,8 +70,7 @@ def extract_text(filepath: str) -> str:
         for encoding in encodings:
             try:
                 with open(filepath, 'r', encoding=encoding) as f:
-                    text = f.read()
-                    return clean_text(text)  # Apply cleaning function
+                    return f.read()
             except UnicodeDecodeError:
                 continue
         raise ValueError(f"Unable to decode the file with any of the following encodings: {encodings}")
@@ -83,14 +84,14 @@ def extract_text(filepath: str) -> str:
     else:
         raise ValueError("Unsupported file type. Please provide a .txt, .pdf, or .parquet file.")
 
-def clean_text(text: str) -> str:
-    # Normalize unicode characters
-    text = unicodedata.normalize('NFKD', text)
-    # Remove non-ASCII characters
-    text = re.sub(r'[^\x00-\x7F]+', '', text)
-    # Replace smart quotes and dashes
-    text = text.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'").replace('–', '-').replace('—', '-')
-    return text
+def clean_text(text: str, normalize: bool = True, handle_unicode: bool = True) -> str:
+    if normalize:
+        text = text.lower()
+    if handle_unicode:
+        text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+    text = re.sub(r'\s+', ' ', text)  # Replace multiple whitespace characters with a single space
+    text = re.sub(r'[^\w\s]', '', text)  # Remove all non-word characters except spaces
+    return text.strip()  # Remove leading and trailing whitespace
 
 def create_tokenizer(text: str) -> Tokenizer:
     tokenizer = Tokenizer(models.BPE())
