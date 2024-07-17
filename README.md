@@ -1,3 +1,5 @@
+![Logo](./_fd23d3d2-3422-46a1-b15d-f6ecd4a65d4c.jpg)
+
 # MyLLM
 
 This repository contains a project that trains and generates text using a GPT-based language model enhanced with Retrieval-Augmented Generation (RAG). The model utilizes PyTorch for deep learning, Sentence-Transformers for encoding documents, and FAISS for efficient similarity search. There is the capability to pause training and resume at a later time, as well as early termination to avoid overfitting.
